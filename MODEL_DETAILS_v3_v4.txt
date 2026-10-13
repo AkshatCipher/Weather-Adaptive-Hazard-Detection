@@ -1,0 +1,605 @@
+================================================================================
+WEATHER CLASSIFIER v3 AND v4 - COMPLETE TECHNICAL RECORD
+Project : Confidence-Aware Weather-Adaptive Hazard Detection (Robotic Perception /
+          Computer Vision course project)
+Machine : ASUS TUF F16, Intel i7-14650HX, 15.6 GB RAM, NVIDIA RTX 5060 Laptop GPU
+          8 GB (Blackwell, sm_120), Windows 11, PyTorch 2.11.0 + CUDA 12.8,
+          torchvision 0.26.0, Python 3.12.14, conda env "weather"
+Written : 19 September 2026
+Every number below was measured on this machine from the saved result files.
+================================================================================
+
+
+CONTENTS
+  1.  What the models are for
+  2.  Version history in one table (v1 to v4)
+  3.  What v3 and v4 predict
+  4.  Architecture
+  5.  How it works, step by step
+  6.  Datasets
+  7.  Train / validation / test split, and why it is split that way
+  8.  Severity labels, and rendering fog and rain onto other cameras
+  9.  Sampling, augmentation and training recipe
+  10. Leave-one-camera-out benchmark (the overfitting test)
+  11. Results: v3
+  12. Results: v4
+  13. v4 compared with CLIP zero-shot
+  14. Known limits and honest caveats
+  15. Files, commands and how to call the model from code
+  16. References
+
+
+--------------------------------------------------------------------------------
+1. WHAT THE MODELS ARE FOR
+--------------------------------------------------------------------------------
+The weather classifier is a RUNTIME-ONLY component of the perception pipeline. For
+each frame it says what the weather is and, for fog, how dense it is. The pipeline
+uses that to choose an image-enhancement setting before object detection and to
+fill the "weather_pred" field of the per-frame record.
+
+It is never used to stratify experimental results. Every result table in the
+project is stratified by the datasets' own ground-truth weather tags, so an error
+of this classifier can never contaminate an experiment.
+
+
+--------------------------------------------------------------------------------
+2. VERSION HISTORY IN ONE TABLE
+--------------------------------------------------------------------------------
+Version  Code folder       Results folder                          What it is
+-------  ----------------  --------------------------------------  ------------------------------------------
+v1       src/              results/weather_classifier/             MobileNetV3-Large, 5 classes, ACDC + BDD100K
+                                                                   10k subset. 98.75% on ACDC test but called
+                                                                   dense Foggy Cityscapes fog "fog" only 21%
+                                                                   of the time (unseen camera).
+v2       src_cityscapes/   results/weather_classifier_cityscapes/  v1 + Foggy and Rain Cityscapes + clean
+                                                                   Cityscapes. First trained WITHOUT clean
+                                                                   frames it learned the camera, not the fog
+                                                                   (called 97% of clear Cityscapes frames fog).
+                                                                   With clean frames: 98.95% ACDC, shortcut gone.
+v3       src_v3/ (frozen)  results/weather_v3/                     3 heads (weather, fog level, rain level),
+                                                                   DINOv2 backbone, fog/rain rendered on all
+                                                                   cameras, leave-one-camera-out benchmark.
+                                                                   FALLBACK MODEL.
+v4       src_v4/           results/weather_v4/                     v3 design + full BDD100K (54,822 training
+                                                                   images instead of 2,064) + DAWN external
+                                                                   test + 2-model ensemble + 3-level fog
+                                                                   calibration + longer training. FINAL MODEL.
+CLIP     src/clip_zeroshot_weather.py, src_v4/compare_clip.py      Zero-shot baseline, no training.
+
+
+--------------------------------------------------------------------------------
+3. WHAT v3 AND v4 PREDICT
+--------------------------------------------------------------------------------
+One forward pass gives three outputs:
+
+  weather     clear | fog | night | rain | snow
+  fog_level   none | light | medium | dense
+  rain_level  none | light | medium | heavy
+
+Fog levels are tied to physical visibility through the attenuation coefficient
+beta of the Foggy Cityscapes dataset (meteorological optical range = 2.996 / beta):
+
+  level    beta range                     centre beta   visibility about
+  light    0.0040 to 0.00707              0.005         600 m
+  medium   0.00707 to 0.01414             0.010         300 m
+  dense    0.01414 to 0.02828             0.020         150 m
+  The bin edges are the geometric means of neighbouring centre values.
+
+What the pipeline receives:
+  fog_level  is reported only when weather = fog, otherwise "none".
+  rain_level is reported only when weather = rain, otherwise "none".
+  If the weather IS fog (or rain) but the severity head itself answers "none", the
+  output is "unrated". The model never invents a level. In practice this happens
+  for real rain (see section 14).
+
+
+--------------------------------------------------------------------------------
+4. ARCHITECTURE
+--------------------------------------------------------------------------------
+Shared design (v3 and each member of v4):
+
+  input image (any size)
+    -> resize short side to the network size, centre crop (252 or 256 px)
+    -> ImageNet mean/std normalisation, done on the GPU
+    -> BACKBONE (pretrained, partly or fully fine-tuned)
+    -> feature vector
+    -> TRUNK: LayerNorm -> Linear(feature, 512) -> GELU -> Dropout(0.2)
+    -> three linear HEADS on the 512-d vector:
+         weather head   Linear(512, 5)
+         fog head       Linear(512, 4)
+         rain head      Linear(512, 4)
+
+Backbones used:
+
+  name           backbone                      pretraining            feature  tuned
+  -------------  ----------------------------  ---------------------  -------  -------------------------
+  dinov2_last2   DINOv2 ViT-S/14 (timm          LVD-142M, self-        768      only the last 2 transformer
+                 vit_small_patch14_dinov2)      supervised                      blocks + final norm
+                 22.06 M parameters                                             (3.95 M trainable)
+  convnext_full  ConvNeXt-Tiny (torchvision)   ImageNet-1K            768      all layers (28.22 M)
+  dinov2_last4   as dinov2_last2               as above               768      last 4 blocks (7.50 M) -
+                                                                                benchmarked, not selected
+  dinov2_frozen  as dinov2_last2               as above               768      heads only (0.40 M) -
+                                                                                benchmarked in v3 only
+  mnv3_full      MobileNetV3-Large             ImageNet-1K V2         1280     all layers (4.87 M) - the
+                                                                                v1/v2 recipe, benchmarked
+                                                                                in v3 only
+
+  DINOv2 feature = class token concatenated with the mean of the patch tokens
+  (384 + 384 = 768). The mean patch token is included because haze is a global,
+  image-wide property, not an object.
+
+  v3 = ONE model:  dinov2_last2, input 252 x 252 px, checkpoint 88.3 MB.
+  v4 = ENSEMBLE of TWO models with different backbones:
+         dinov2_last2   (252 px, 88.3 MB)  +  convnext_full (256 px, 113.0 MB)
+       The softmax outputs of the two models are averaged, and each model is also
+       run on the left-right mirrored image (test-time augmentation), so one
+       prediction = the average of 4 forward passes.
+       Why two different backbones: an ensemble only helps when its members make
+       different mistakes. The benchmark showed DINOv2 stronger on the weather
+       head and ConvNeXt stronger on the fog level.
+
+
+--------------------------------------------------------------------------------
+5. HOW IT WORKS, STEP BY STEP
+--------------------------------------------------------------------------------
+prepare  Scans every dataset, assigns each image a source, a split, a weather label
+         and (where known) a severity label. Writes manifest.csv. Every image is
+         resized ONCE to 320 px short side and cached as JPEG quality 92, using a
+         thread pool (not processes: on this 16 GB Windows laptop every spawned
+         worker re-imports PyTorch and the machine ran out of memory).
+depth    Runs the Depth Anything V2 Small network on the clear-weather images that
+         will have fog or rain rendered onto them, stores normalised inverse depth
+         as 16-bit PNG. Then CALIBRATES the fog renderer against real fog frames.
+lodo     Leave-one-camera-out benchmark: trains on two cameras, tests on the third,
+         for each camera and each candidate recipe. Ranks the recipes.
+train    Trains the chosen recipe(s) on all cameras. Keeps the epoch with the best
+         validation score. Then evaluates on the test split.
+eval     Scores the model on the test split and builds the comparison table with
+         the older models on identical rows.
+predict  Writes a CSV for any folder of images.
+
+Loss:  cross-entropy(weather) + 0.5 x cross-entropy(fog level) + 0.5 x
+       cross-entropy(rain level), all with label smoothing 0.05. Rows whose severity
+       is unknown are masked out of the severity losses (ignore_index = -1).
+Model selection score on the validation split:
+       0.6 x weather macro-F1 + 0.2 x fog-level balanced accuracy
+       + 0.2 x rain-level balanced accuracy.
+
+
+--------------------------------------------------------------------------------
+6. DATASETS
+--------------------------------------------------------------------------------
+All under D:\Projects\Weather analysed object detection
+
+Dataset                 Folder                                   Images used          Role
+----------------------  ---------------------------------------  -------------------  --------------------------------
+ACDC                    rgb_anon_trainvaltest_ACDC               8,012                real fog, night, rain, snow (GoPro,
+                                                                                      Switzerland) + a clear reference
+                                                                                      frame of every scene
+BDD100K 10k subset      bdd100k-10k                              v3: 2,486 labelled   real US dashcam frames
+BDD100K full (v4 only)  bdd100k/bdd100k/bdd100k/images/100k      v4: 65,863 labelled  same, all 80,000 labelled images
+                                                                                      minus dawn/dusk and undefined
+Cityscapes clean        leftImg8bit_trainvaltest                 3,475                clear frames, German cities
+Foggy Cityscapes-DBF    leftImg8bit_trainval_foggyDBF            10,425               the same 3,475 scenes at beta
+                                                                                      0.005 / 0.01 / 0.02
+RainCityscapes          leftImg8bit_trainval_rain                10,620               295 scenes x 3 intensities x 12
+                                                                                      streak patterns
+DAWN (v4 only)          DAWN                                     704 + 323            real fog/rain/snow from unknown
+                                                                                      cameras (web images). TEST ONLY.
+                                                                                      323 sandstorm images = probe only
+
+BDD100K label mapping (its tags are weather + time of day):
+  timeofday = night                          -> night
+  daytime + clear / overcast / partly cloudy -> clear
+  daytime + rainy / snowy / foggy            -> rain / snow / fog
+  dawn-dusk, or undefined weather            -> dropped (12,193 of 69,863 training
+                                                images: neither clearly day nor
+                                                night, or no usable tag)
+BDD100K is overwhelmingly clear and night. Its whole training set holds only 2,522
+rainy, 2,862 snowy and 48 foggy usable images; v4 uses all of them.
+
+Why RainCityscapes is used here although the main project excludes it: it is the
+only source of rain-intensity labels. It is used for this side component only.
+
+Why sandstorm is NOT a class: DAWN is its only source (323 web images). A class
+defined by one small dataset teaches the dataset's look, which is exactly the v2
+camera-shortcut failure, and training on any part of DAWN would destroy the only
+test from cameras the model has never seen.
+
+
+--------------------------------------------------------------------------------
+7. TRAIN / VALIDATION / TEST SPLIT, AND WHY
+--------------------------------------------------------------------------------
+Dataset               Train                      Validation               Test
+--------------------  -------------------------  -----------------------  ------------------------
+ACDC                  official train (3,200)     official val (812)       official test (4,000)
+BDD100K  v3           2,064                      104                      318
+BDD100K  v4           54,822                     2,848                    8,193
+Cityscapes clean      16 cities (2,724)          erfurt, weimar (251)     frankfurt, lindau,
+Foggy Cityscapes      16 cities (8,172)          erfurt, weimar (753)     munster (500 / 1,500 /
+RainCityscapes        16 cities (7,272)          erfurt, weimar (2,160)   1,188)
+Rendered fog / rain   follows its base image     same                     same, fixed severity
+DAWN                  never                      never                    704 (external)
+
+Real images, totals:    v3  train 23,432 | val 4,080 | test  7,506
+                        v4  train 76,190 | val 6,824 | test 16,085
+Rendered rows:          v3  15,982       | v4  30,562
+Manifest rows:          v3  51,000       | v4 129,661
+
+v4 BDD100K training images per class: clear 23,042, night 26,612, rain 2,411,
+snow 2,714, fog 43.
+
+WHY each rule:
+
+ a) ACDC: the official split is used exactly as shipped. ACDC frames come from long
+    GoPro recordings; a random split would put near-identical neighbouring frames in
+    train and test. The official split is not disjoint at the recording level (28 of
+    60 recording ids appear in more than one split, with different frames), so the
+    script checks that no (recording, frame) pair is in two splits and reports the
+    overlap instead of hiding it.
+
+ b) Cityscapes (clean, fog, rain): split BY CITY, with ONE city list shared by all
+    three. The parameters in the file names (fog beta; rain alpha, beta, dropsize,
+    pattern) are different renderings of the SAME street frame: 3 fog levels and 36
+    rain renderings per scene. Splitting by image would leak every test scene into
+    training. Splitting by city keeps all renderings of a scene, and its clean twin,
+    in one split. The test cities are Cityscapes' own official validation cities.
+
+ c) BDD100K: split BY LABEL FILE and BY VIDEO. The official validation labels are
+    the held-out TEST set. 5% of the training VIDEOS (hash of the video id) form the
+    validation set, so frames of one drive never straddle train and validation.
+    318 BDD100K test images had been training images of v2; they are excluded from
+    every comparison row, leaving 7,875 fair test images.
+
+ d) Rendered rows inherit the split of their clear base image. Training rows draw a
+    new random severity every time they are loaded; validation and test rows have a
+    fixed severity derived from the file path, so evaluation is reproducible.
+
+ e) DAWN is never trained or validated on. It is the only test from cameras and
+    image styles the model has never seen.
+
+ f) Leakage guards asserted on every run: no duplicate image path, no scene in two
+    splits, no Cityscapes city in two splits, DAWN only in test, every rendered row
+    in the same split as its base image.
+
+
+--------------------------------------------------------------------------------
+8. SEVERITY LABELS AND WEATHER RENDERING
+--------------------------------------------------------------------------------
+Where a severity label is known:
+  every clear image of every camera        fog none, rain none
+  Foggy Cityscapes beta 0.005/0.01/0.02    fog light / medium / dense, rain none
+  RainCityscapes intensity 1 / 2 / 3       rain light / medium / heavy
+  fog / rain rendered by this project      the level used for rendering
+  real fog, rain, snow, night images       UNKNOWN -> masked out of the severity loss
+
+The problem: real severity labels exist for ONE camera only (Cityscapes). v2 showed
+what that produces: a model that recognises the camera. So fog and rain are rendered
+onto clear frames of ALL THREE cameras.
+
+Fog rendering (atmospheric scattering model, Koschmieder):
+      I = J * t + A * (1 - t),      t = exp(-beta * d)
+  J = clear image, A = atmospheric light (mean colour of the 0.1% brightest
+  dark-channel pixels, kept bright and greyish), d = distance in metres.
+  Distance comes from a monocular depth network (Depth Anything V2 Small). It
+  outputs relative inverse depth q, normalised to [0,1] per image, mapped to metres:
+      v3:  d = d_near / (q + q0)
+      v4:  d = d_near / (q + q0) ** gamma
+  Training draws beta log-uniformly from 0.004 to 0.0283, so the model sees a
+  continuous range of fog densities, not three fixed ones.
+
+Rain rendering: depth-dependent haze (beta 0.005 / 0.010 / 0.015, the same coupling
+RainCityscapes uses) plus fine 1-pixel motion-blurred streaks whose density and
+length grow with the level.
+
+Calibration against REAL fog: the renderer's parameters are fitted so that fog
+rendered on a clean Cityscapes frame matches the real Foggy Cityscapes frame of the
+same scene.
+  v3: fitted at beta 0.01 only, 150 scenes. d_near 6.0, q0 0.025.
+      Pixel error 10.33 (doing nothing: 36.64).
+      Consequence found later: its fog read about one level too dense.
+  v4: fitted at all three betas at once, 100 scenes, with a penalty on signed bias.
+      d_near 5.0, q0 0.07, gamma 1.25.
+        beta 0.005  pixel error  7.08 (doing nothing 21.37)  bias -1.26
+        beta 0.010  pixel error 10.05 (doing nothing 36.51)  bias -0.01
+        beta 0.020  pixel error 12.62 (doing nothing 58.51)  bias +2.43
+      Effect: rendered-fog levels on Cityscapes graded correctly 93.8% (v3: 84.4%).
+
+
+--------------------------------------------------------------------------------
+9. SAMPLING, AUGMENTATION AND TRAINING RECIPE
+--------------------------------------------------------------------------------
+Sampling. One epoch is a fixed number of random draws, not a pass over the data:
+  - every weather class receives 1/5 of the draws (handles class imbalance);
+  - inside a class, a source's share is proportional to sqrt(number of scenes),
+    multiplied by 0.35 for rendered sources so real images dominate;
+  - inside a source every SCENE is equally likely;
+  - inside a scene every rendering is equally likely.
+  Reason: RainCityscapes has only 202 training scenes drawn 36 ways. Sampling per
+  image would let those 202 streets swamp the rain class.
+
+Augmentation (training only):
+  - RandomResizedCrop, area 0.6 to 1.0, aspect 0.9 to 1.1, and horizontal flip;
+  - camera-agnostic jitter applied AFTER weather rendering: per-channel colour gain
+    +-7% (p 0.3), downscale-upscale by 0.5 to 0.9 (p 0.3), JPEG re-compression at
+    quality 35 to 90 (p 0.4). This removes camera fingerprints and stops rendered
+    images being recognised by their missing compression artefacts;
+  - brightness and contrast are NEVER changed: they are the fog and night cues.
+
+Optimisation:
+  AdamW, weight decay 0.05 (none on biases and norm layers), cosine schedule with a
+  1-epoch linear warm-up, bfloat16 autocast without a gradient scaler, fixed seed 0.
+                       head LR   backbone LR   batch   input
+    dinov2_last2       5e-4      2e-5          48      252 px
+    convnext_full      2e-4      2e-5          32      256 px
+                       epochs   draws/epoch   total draws   training time
+    v3                 20       16,000        320,000       21.6 min
+    v4 dinov2_last2    30       24,000        720,000       60.0 min  (best epoch 28)
+    v4 convnext_full   30       24,000        720,000       68.4 min  (best epoch 23)
+  Loader processes are capped automatically from free RAM and free Windows commit
+  memory (this machine's commit limit of about 21 GB caused two earlier crashes).
+
+
+--------------------------------------------------------------------------------
+10. LEAVE-ONE-CAMERA-OUT BENCHMARK (THE OVERFITTING TEST)
+--------------------------------------------------------------------------------
+"Does not overfit" is measured, not asserted. For each camera family (ACDC,
+BDD100K, Cityscapes) a model is trained on the other two and tested on images of
+the camera it never saw. 6 epochs x 10,000 draws per run, single seed.
+
+v3 benchmark (mean over the three held-out cameras):
+  recipe          weather acc   weather macro-F1   fog level   rain level   selection
+  dinov2_last2    0.9044        0.7068             0.7779      0.8623       0.7521  <- chosen
+  convnext_full   0.8812        0.6897             0.8047      0.8649       0.7477
+  mnv3_full       0.8598        0.6583             0.7952      0.8456       0.7232
+  dinov2_frozen   0.8640        0.6459             0.7124      0.8275       0.6955
+
+v4 benchmark (with full BDD100K):
+  recipe          weather acc   weather macro-F1   fog level   rain level   selection
+  dinov2_last2    0.9391        0.7387             0.7954      0.8589       0.7741  <- member 1
+  dinov2_last4    0.9358        0.7288             0.7813      0.8634       0.7662
+  convnext_full   0.9081        0.6546             0.8245      0.8642       0.7305  <- member 2
+
+  v4 per held-out camera, dinov2_last2:
+    unseen ACDC         0.9663 accuracy (4,812 images)
+    unseen BDD100K      0.8967 accuracy (11,041 images)
+    unseen Cityscapes   0.9543 accuracy (6,352 images)
+
+Reading:
+  - The honest generalisation figure is about 94% on a camera never seen, against
+    99.7% on cameras that were trained on. v3's figure was about 90%.
+  - A model that never saw ACDC scored 96.6% on it: it learned weather, not cameras.
+  - Fog levels transfer: a model that saw neither the Cityscapes camera nor the
+    Foggy Cityscapes renderer graded that real fog at 67 to 82% balanced accuracy.
+  - Rain levels do not transfer (about 60% on unseen Cityscapes).
+  - Macro-F1 on BDD100K is low for every model because BDD100K has almost no fog
+    and its rain and snow tags are noisy; use accuracy for that camera.
+  - Differences below about 0.01 between recipes are within single-seed noise.
+  - Ensemble members: best recipe + best recipe of a DIFFERENT backbone.
+
+
+--------------------------------------------------------------------------------
+11. RESULTS: v3  (results/weather_v3/)
+--------------------------------------------------------------------------------
+Weather head, test split:
+  ACDC test                       99.48%   (21 errors of 4,000; v2: 42)
+  Cityscapes clear called clear   99.60%
+  Foggy Cityscapes called fog     99.2 / 99.6 / 100% (light / medium / dense)
+  RainCityscapes called rain      100%
+  BDD100K (318 images)            93.4%   (not comparable with v2, which was trained
+                                           on those 318 images)
+Fog level:
+  real Foggy Cityscapes, unseen cities   95.00% exact, 99.80% within one level
+  fog rendered on ACDC / BDD100K frames  97.83% / 97.88%
+  fog rendered on Cityscapes frames      84.40%  (renderer about one level too dense)
+Rain level:
+  RainCityscapes, unseen cities          95.98% exact
+Real fog, no ground truth: ACDC fog graded 221 light / 266 medium / 12 dense / 1 none.
+Known failure: rain level answers "none" on 496 of 500 real ACDC rain frames.
+
+
+--------------------------------------------------------------------------------
+12. RESULTS: v4  (results/weather_v4/)
+--------------------------------------------------------------------------------
+All columns on IDENTICAL real test images (16,085; BDD100K rows exclude the 318
+images v2 was trained on).
+
+                                   v2       v3       convnext  dinov2   v4 (ensemble)
+  ACDC test accuracy               0.9895   0.9948   0.9908    0.9968   0.9972
+  ACDC test macro-F1               0.9860   0.9936   0.9888    0.9965   0.9968
+  BDD100K test accuracy (7,875)    0.9454   0.9538   0.9595    0.9585   0.9636
+  BDD100K test macro-F1            0.7053   0.7242   0.7515    0.7481   0.7888
+  BDD100K clear recall             0.9516   0.9632   0.9613    0.9523   0.9657
+  BDD100K night recall             0.9867   0.9890   0.9921    0.9936   0.9939
+  BDD100K rain recall              0.7320   0.7210   0.7762    0.8122   0.8122
+  BDD100K snow recall              0.6919   0.7500   0.7980    0.8030   0.7929
+  DAWN accuracy (unknown cameras)  0.6918   0.7401   0.7273    0.6747   0.7429
+  DAWN fog recall                  0.7233   0.9467   0.8867    0.9267   0.9333
+  DAWN rain recall                 0.5300   0.3000   0.4950    0.4550   0.5150
+  DAWN snow recall                 0.8039   0.8676   0.7206    0.5196   0.6863
+  Cityscapes clear called clear    0.9980   0.9960   0.9980    0.9980   1.0000
+  Foggy CS light called fog        0.9920   0.9920   0.9940    0.9840   0.9940
+  Foggy CS medium called fog       1.0000   0.9960   1.0000    0.9980   0.9980
+  Foggy CS dense called fog        1.0000   1.0000   1.0000    1.0000   1.0000
+  RainCityscapes called rain       1.0000   1.0000   1.0000    1.0000   1.0000
+
+v4 confusion matrices (rows true, columns predicted: clear fog night rain snow):
+  ACDC test, 11 errors of 4,000
+    clear  1993    7    0    0    0
+    fog       0  500    0    0    0
+    night     0    0  500    0    0
+    rain      1    1    0  498    0
+    snow      0    0    0    2  498
+  BDD100K test, 287 errors of 7,875
+    clear  3095    4   33   27   46
+    fog       2    2    0    1    0
+    night    18    0 3883    1    5
+    rain     50    1    5  294   12
+    snow     62    0    9   11  314
+  DAWN, 181 errors of 704
+    fog       1  280   10    9    0
+    rain      3   87    6  103    1
+    snow      0   62    1    1  140
+
+Fog level (v4):
+  real Foggy Cityscapes, unseen cities   97.85% exact, 99.90% within one level
+       none    500    0    0    0
+       light     3  489    8    0
+       medium    1   14  484    1
+       dense     0    1   15  484
+  fog rendered on ACDC frames            99.17%
+  fog rendered on BDD100K frames         97.33%
+  fog rendered on Cityscapes frames      93.80%  (v3: 84.40%)
+Rain level (v4):
+  RainCityscapes, unseen cities          99.40% exact
+  rendered rain on all three cameras     100%
+Real weather, no ground truth (plausibility only):
+  ACDC real fog graded     3 none / 129 light / 343 medium / 25 dense
+  DAWN real fog graded    18 none / 14 light / 34 medium / 234 dense (storm imagery)
+  real rain graded "none": 500 of 500 ACDC, 396 of 396 BDD100K, 197 of 200 DAWN
+Out-of-distribution probe: 323 DAWN sandstorm images (never taught, not a class):
+  310 called fog, 10 clear, 2 rain, 1 night; mean confidence 0.88.
+Confidence separates right from wrong on BDD100K: 0.94 when right, 0.77 when wrong.
+Validation score kept improving slowly to the end of training; the best epochs were
+28 and 23 of 30, so training did not run past the point of overfitting.
+
+
+--------------------------------------------------------------------------------
+13. v4 COMPARED WITH CLIP ZERO-SHOT
+--------------------------------------------------------------------------------
+CLIP = open_clip ViT-B-32-quickgelu with OpenAI weights, 4 text prompts per class
+averaged ("a photo of a road in the rain", ...), NO training on any of this data.
+Same 16,085 real test images. Script: src_v4/compare_clip.py.
+
+                                   CLIP zero-shot   v4 (ensemble)   difference
+  ACDC test accuracy               0.9660           0.9972          +3.1 points
+  BDD100K test accuracy (7,875)    0.8903           0.9636          +7.3 points
+  BDD100K test macro-F1            0.6145           0.7888          +0.17
+  BDD100K night recall             0.9281           0.9939          +6.6
+  BDD100K rain recall              0.8536           0.8122          -4.1  (CLIP higher)
+  BDD100K snow recall              0.3485           0.7929          +44.4
+  Cityscapes clear called clear    0.9620           1.0000          +3.8
+  Foggy CS light called fog        0.6400           0.9940          +35.4
+  Foggy CS medium called fog       0.8480           0.9980          +15.0
+  Foggy CS dense called fog        0.9420           1.0000          +5.8
+  RainCityscapes called rain       0.8375           1.0000          +16.3
+  DAWN accuracy (unknown cameras)  0.8267           0.7429          -8.4  (CLIP higher)
+  DAWN fog recall                  0.8233           0.9333          +11.0
+  DAWN rain recall                 0.6650           0.5150          -15.0 (CLIP higher)
+  DAWN snow recall                 0.9902           0.6863          -30.4 (CLIP higher)
+
+CLIP confusions:
+  BDD100K: clear 2935 / 16 fog / 34 night / 208 rain / 12 snow
+           night   20 / 4 / 3626 / 187 rain / 70 snow
+           rain    35 / 2 / 3 / 309 / 13
+           snow   216 clear / 0 / 9 / 33 / 138
+  DAWN:    fog 247 of 300, rain 133 of 200 (62 called fog), snow 202 of 204
+
+Reading:
+  - On driving footage (ACDC, BDD100K, Cityscapes) v4 wins clearly: +3 to +7 points
+    overall, and much more on light fog and on BDD100K snow, where CLIP calls 216 of
+    396 snowy frames clear. CLIP's higher BDD100K rain recall is bought with false
+    alarms: it calls 208 clear and 187 night frames rain.
+  - On DAWN (web images, unknown cameras) CLIP wins, 82.7% to 74.3%, almost entirely
+    on snow (99% to 69%) and rain. CLIP was pretrained on hundreds of millions of web
+    images, which is exactly what DAWN is; v4 has only ever seen dashcam-style video.
+    v4 sends DAWN's heavy storms to "fog" because their visibility is very low.
+  - CLIP gives no fog level and no rain level at all.
+  - Conclusion: for this project's frames (dashcam and GoPro driving footage) v4 is
+    the better classifier. For arbitrary internet images CLIP is the more robust one.
+    This is the same specialist-versus-generalist pattern seen between v1 and CLIP.
+
+
+--------------------------------------------------------------------------------
+14. KNOWN LIMITS AND HONEST CAVEATS
+--------------------------------------------------------------------------------
+ 1. Rain level does not work on real rain. It was learned from synthetic streaks
+    (RainCityscapes and this project's renderer); real rain shows wet roads, spray
+    and grey skies, not streaks. The head answers "none" on essentially all real
+    rain, and the output is "unrated". No dataset labels real rain severity, so more
+    data cannot fix it. Use one fixed enhancement setting for rain.
+ 2. Fog level on REAL fog cannot be scored: no dataset labels real fog severity. It
+    is validated on synthetic-on-real Foggy Cityscapes (97.85%) and on rendered fog.
+    On other cameras it is consistent with a renderer whose scale is within one
+    level of Foggy Cityscapes.
+ 3. BDD100K accuracy has a ceiling below 100% for any model: wet roads are tagged
+    rainy and snow on the ground under a clear sky is tagged snowy.
+ 4. Real fog is scarce: 400 ACDC training images and 43 in BDD100K. Fog knowledge
+    comes mostly from Foggy Cityscapes and rendered fog.
+ 5. Outside driving footage the model is weaker (DAWN 74%).
+ 6. Dawn and dusk frames were dropped in training; their behaviour is untested.
+ 7. Benchmarks are single-seed; differences under about 0.01 are noise.
+ 8. The Cityscapes fog and rain test cities share the camera and the renderer with
+    training (different cities). Unseen-camera ability is what section 10 measures.
+
+
+--------------------------------------------------------------------------------
+15. FILES, COMMANDS AND USE FROM CODE
+--------------------------------------------------------------------------------
+v4 (final)
+  code      src_v4/weather_v4_lib.py, src_v4/train_weather_v4.py, src_v4/compare_clip.py
+  model     results/weather_v4/ckpt_dinov2_last2.pt, results/weather_v4/ckpt_convnext_full.pt
+  results   metrics.json, comparison.csv, comparison_with_clip.csv, lodo_results.csv,
+            lodo_summary.csv, lodo_best.json, fog_render_params.json, history_*.csv,
+            sampling_shares.csv, confusion_condition_{all_real,bdd,dawn}.png,
+            confusion_fog_level_cityscapes_test.png,
+            confusion_rain_level_cityscapes_test.png, eval_predictions.csv, log_*.txt
+  commands  python src_v4\train_weather_v4.py prepare | depth | lodo | train | eval
+            python src_v4\train_weather_v4.py predict --predict-dir <folder>
+            python src_v4\compare_clip.py
+
+  import sys, glob; sys.path.insert(0, "src_v4")
+  from weather_v4_lib import load_ensemble, predict_image_ensemble
+  models = load_ensemble(sorted(glob.glob("results/weather_v4/ckpt_*.pt")), "cuda")
+  r = predict_image_ensemble(models, bgr_frame)      # bgr_frame: HxWx3 uint8 from cv2
+  r["weather"], r["fog_level"], r["rain_level"], r["p_weather"], r["p_fog_level"]
+
+v3 (frozen fallback)
+  code      src_v3/weather_v3_lib.py, src_v3/train_weather_v3.py
+  model     results/weather_v3/best.pt
+  commands  python src_v3\train_weather_v3.py eval
+            python src_v3\train_weather_v3.py predict --predict-dir <folder>
+            prepare / depth / lodo / train refuse to run while best.pt exists, so the
+            fallback cannot be overwritten (--out <other folder> or --force overrides).
+  The restored v3 code was verified by re-running eval on a copy of the results and
+  reproducing every logged number exactly.
+
+  import sys; sys.path.insert(0, "src_v3")
+  from weather_v3_lib import load_model, predict_image
+  model, meta = load_model("results/weather_v3/best.pt", "cuda")
+  r = predict_image(model, meta, bgr_frame)
+
+Shared cache: results/weather_classifier/cache (resized JPEGs and depth maps for
+every version; only cache files are written there).
+
+
+--------------------------------------------------------------------------------
+16. REFERENCES
+--------------------------------------------------------------------------------
+ [1] Sakaridis, Dai, Van Gool. ACDC: The Adverse Conditions Dataset with
+     Correspondences. ICCV 2021.
+ [2] Yu et al. BDD100K: A Diverse Driving Dataset for Heterogeneous Multitask
+     Learning. CVPR 2020.
+ [3] Cordts et al. The Cityscapes Dataset for Semantic Urban Scene Understanding.
+     CVPR 2016.
+ [4] Sakaridis, Dai, Hecker, Van Gool. Model Adaptation with Synthetic and Real Data
+     for Semantic Dense Foggy Scene Understanding (Foggy Cityscapes-DBF, fog density
+     estimation from beta levels). ECCV 2018. arXiv 1808.01265.
+ [5] Hu, Fu, Zhu, Heng. Depth-Attentional Features for Single-Image Rain Removal
+     (RainCityscapes). CVPR 2019.
+ [6] Kenk, Hassaballah. DAWN: Vehicle Detection in Adverse Weather Nature Dataset.
+     2020. Mendeley Data 766ygrbt8y.
+ [7] Oquab et al. DINOv2: Learning Robust Visual Features without Supervision.
+     TMLR 2024.
+ [8] Liu et al. A ConvNet for the 2020s (ConvNeXt). CVPR 2022.
+ [9] Yang et al. Depth Anything V2. NeurIPS 2024.
+[10] Radford et al. Learning Transferable Visual Models From Natural Language
+     Supervision (CLIP). ICML 2021.
+[11] He, Sun, Tang. Single Image Haze Removal Using Dark Channel Prior. CVPR 2009
+     (atmospheric light estimate).
+[12] Bridging the Generalization Gap in Adverse Weather Segmentation: A Training
+     Recipe Perspective. arXiv 2605.27962 (recipe choices).
+[13] Enhancing Visual Perception in Foggy Conditions via Multiclass Fog Density
+     Modeling. arXiv 2608.01572 (fog rendered with estimated depth for severity).
+================================================================================

@@ -1,0 +1,21 @@
+# datasets live outside the repository (see PROJECT_GUIDE.md section 5)
+DAWN/
+bdd100k/
+bdd100k-10k/
+gtFine_trainvaltest/
+gt_detection_trainval/
+leftImg8bit_trainval_foggyDBF/
+leftImg8bit_trainval_rain/
+leftImg8bit_trainvaltest/
+rgb_anon_trainvaltest_ACDC/
+# regenerated at run time
+weights/
+results/*/cache/
+results/core/records/
+results/core/.stop_app
+results/core/run_*.mp4
+results/core/run_*.csv
+results/core/run_*.jsonl
+__pycache__/
+*.pyc
+.pytest_cache/
